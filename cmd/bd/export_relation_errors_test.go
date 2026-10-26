@@ -131,6 +131,14 @@ func TestClassicExportPathsRejectRelationLoaderFailures(t *testing.T) {
 			_, err := storeExportSource{}.LoadExportRelations(t.Context(), issues)
 			assertRelationLoaderErr(t, "LoadExportRelations", err, loader.sentinel, loader.wantPrefix)
 
+			// Incremental auto-export encoder: no records, so the patch path
+			// never reaches rewriteExportFile.
+			records, err := encodeIssueRecords(t.Context(), []*types.Issue{{ID: "bd-export1", Title: "export me"}})
+			assertRelationLoaderErr(t, "encodeIssueRecords", err, loader.sentinel, loader.wantPrefix)
+			if records != nil {
+				t.Fatalf("encodeIssueRecords records = %v, want nil", records)
+			}
+
 			// Full auto-export writer over a previous export: the atomic
 			// temp file is aborted, so the old JSONL survives byte for byte
 			// and nothing else is left beside it.

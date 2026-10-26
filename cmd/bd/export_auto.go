@@ -1515,8 +1515,9 @@ func loadExistingIssueLines(path string) (*orderedIssueLines, error) {
 }
 
 // encodeIssueRecords produces the JSON wire form for a batch of issues
-// using the same bulk-loader pattern the full export uses. Returns a map
-// from issue ID → line bytes (no trailing newline).
+// using the same bulk loader the full export uses. Returns a map from
+// issue ID → line bytes (no trailing newline), or an error and no records
+// when any relation fails to load (GH#6870).
 func encodeIssueRecords(ctx context.Context, issues []*types.Issue) (map[string][]byte, error) {
 	if len(issues) == 0 {
 		return nil, nil
@@ -1525,18 +1526,17 @@ func encodeIssueRecords(ctx context.Context, issues []*types.Issue) (map[string]
 	for i, iss := range issues {
 		ids[i] = iss.ID
 	}
-	labelsMap, _ := store.GetLabelsForIssues(ctx, ids)
-	allDeps, _ := store.GetDependencyRecordsForIssues(ctx, ids)
-	commentsMap, _ := store.GetCommentsForIssues(ctx, ids)
-	commentCounts, _ := store.GetCommentCounts(ctx, ids)
-	depCounts, _ := store.GetDependencyCounts(ctx, ids)
+	relations, err := loadClassicExportRelations(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make(map[string][]byte, len(issues))
 	for _, iss := range issues {
-		iss.Labels = labelsMap[iss.ID]
-		iss.Dependencies = allDeps[iss.ID]
-		iss.Comments = commentsMap[iss.ID]
-		counts := depCounts[iss.ID]
+		iss.Labels = relations.labels[iss.ID]
+		iss.Dependencies = relations.deps[iss.ID]
+		iss.Comments = relations.comments[iss.ID]
+		counts := relations.depCounts[iss.ID]
 		if counts == nil {
 			counts = &types.DependencyCounts{}
 		}
@@ -1547,7 +1547,7 @@ func encodeIssueRecords(ctx context.Context, issues []*types.Issue) (map[string]
 				Issue:           iss,
 				DependencyCount: counts.DependencyCount,
 				DependentCount:  counts.DependentCount,
-				CommentCount:    commentCounts[iss.ID],
+				CommentCount:    relations.commentCounts[iss.ID],
 			},
 		}
 		data, err := json.Marshal(rec)
