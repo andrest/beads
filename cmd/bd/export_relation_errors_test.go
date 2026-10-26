@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -116,4 +118,87 @@ func TestClassicExportPathsRejectRelationLoaderFailures(t *testing.T) {
 			assertRelationLoaderErr(t, "LoadExportRelations", err, loader.sentinel, loader.wantPrefix)
 		})
 	}
+}
+
+// useClassicExportStore installs s as the classic store for runExport and
+// pins the globals that would route it to the proxied or JSON paths.
+func useClassicExportStore(t *testing.T, s storage.DoltStorage) {
+	t.Helper()
+	saveAndRestoreGlobals(t)
+	ensureCleanGlobalState(t)
+	oldCtx, oldProxied, oldJSON := rootCtx, proxiedServerMode, jsonOutput
+	t.Cleanup(func() {
+		rootCtx, proxiedServerMode, jsonOutput = oldCtx, oldProxied, oldJSON
+		resetCommandContext()
+	})
+	rootCtx, proxiedServerMode, jsonOutput = t.Context(), false, false
+	exportAll, exportIncludeInfra, exportScrub = false, false, false
+	exportNoMemories, exportIncludeMemories = false, false
+	store = s
+	if usesProxiedServer() || storeIsRemoteBackend(store) {
+		t.Fatal("precondition: runExport must take the classic storeExportSource path")
+	}
+}
+
+// TestRunExportFailsWhenRelationLoaderFails pins GH#6870 end to end on
+// `bd export`: a failing relation loader exits non-zero before any record is
+// written, prints no success summary, and leaves the -o target untouched.
+func TestRunExportFailsWhenRelationLoaderFails(t *testing.T) {
+	const seed = `{"id":"bd-export1","title":"export me","status":"open","issue_type":"task","labels":["keep"]}` + "\n"
+	for _, loader := range exportRelationLoaders {
+		t.Run(loader.name, func(t *testing.T) {
+			useClassicExportStore(t, &failingExportRelationStore{fail: loader.name})
+			exportOutput = filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(exportOutput, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var err error
+			stderr := captureStderr(t, func() { err = runExport(exportCmd, nil) })
+			if err == nil {
+				t.Fatalf("runExport err = nil, want failure; stderr:\n%s", stderr)
+			}
+			if want := "failed to load relational data: " + loader.wantPrefix + ": "; !strings.Contains(stderr, want) {
+				t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+			}
+			if strings.Contains(stderr, "Exported") {
+				t.Fatalf("stderr = %q, want no export summary", stderr)
+			}
+			if got, readErr := os.ReadFile(exportOutput); readErr != nil || string(got) != seed {
+				t.Fatalf("export target changed: got %q (err %v), want %q", got, readErr, seed)
+			}
+		})
+	}
+
+	t.Run("absent output stays absent", func(t *testing.T) {
+		useClassicExportStore(t, &failingExportRelationStore{fail: "labels"})
+		exportOutput = filepath.Join(t.TempDir(), "issues.jsonl")
+
+		var err error
+		_ = captureStderr(t, func() { err = runExport(exportCmd, nil) })
+		if err == nil {
+			t.Fatal("runExport err = nil, want failure")
+		}
+		if _, statErr := os.Stat(exportOutput); !os.IsNotExist(statErr) {
+			t.Fatalf("failed export published %q: stat err = %v", exportOutput, statErr)
+		}
+		entries, readErr := os.ReadDir(filepath.Dir(exportOutput))
+		if readErr != nil || len(entries) != 0 {
+			t.Fatalf("output dir entries = %v (err %v), want none", entries, readErr)
+		}
+	})
+
+	t.Run("stdout writes no records", func(t *testing.T) {
+		useClassicExportStore(t, &failingExportRelationStore{fail: "labels"})
+		exportOutput = ""
+
+		var err error
+		stdout := captureStdout(t, func() error { err = runExport(exportCmd, nil); return nil })
+		if err == nil {
+			t.Fatal("runExport err = nil, want failure")
+		}
+		if stdout != "" {
+			t.Fatalf("stdout = %q, want no records", stdout)
+		}
+	})
 }
