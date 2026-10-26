@@ -315,3 +315,74 @@ func TestPull_SameProjectRespellingUpdatesExistingBead(t *testing.T) {
 		})
 	}
 }
+
+// TestPull_GroupModeSameIIDStableAcrossProjects pins group mode under the
+// project-qualified fallback key: one bulk pull spanning two group projects
+// that both have issue 7 must update each project's bead in place, and no
+// bead may be rewritten to the other project's URL. Beads are linked with
+// work_items-spelled web_urls while the pull returns issues-spelled ones, the
+// spelling drift the fallback exists to heal — and the drift that, keyed by
+// bare IID alone, made one bead capture both projects' updates.
+func TestPull_GroupModeSameIIDStableAcrossProjects(t *testing.T) {
+	const (
+		projectAIssuesRef = "https://gitlab.com/group-a/project-a/-/issues/7"
+		projectBIssuesRef = "https://gitlab.com/group-b/project-b/-/issues/7"
+	)
+	projectAWorkItemRef := "https://gitlab.com/group-a/project-a/-/work_items/7"
+	projectBWorkItemRef := "https://gitlab.com/group-b/project-b/-/work_items/7"
+	srv := newIssueListServer(t, "/groups/30/issues",
+		gitLabIssueJSON(8007, 7, "Project A issue 7", projectAIssuesRef),
+		gitLabIssueJSON(9007, 7, "Project B issue 7", projectBIssuesRef))
+
+	tr := &Tracker{client: NewClient("token", srv.URL, "").WithGroupID("30"), config: DefaultMappingConfig()}
+	store := &crossProjectStore{issues: map[string]*types.Issue{
+		"bd-a7": {
+			ID:          "bd-a7",
+			Title:       "Project A issue 7 stale",
+			Status:      types.StatusOpen,
+			IssueType:   types.TypeTask,
+			ExternalRef: &projectAWorkItemRef,
+		},
+		"bd-b7": {
+			ID:          "bd-b7",
+			Title:       "Project B issue 7 stale",
+			Status:      types.StatusOpen,
+			IssueType:   types.TypeTask,
+			ExternalRef: &projectBWorkItemRef,
+		},
+	}}
+	engine := tracker.NewEngine(tr, store, "test")
+
+	first, err := engine.Sync(context.Background(), tracker.SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("first Sync: %v", err)
+	}
+	if first.PullStats.Created != 0 || first.PullStats.Updated != 2 {
+		t.Fatalf("first pull stats: created=%d updated=%d, want created=0 updated=2 (each bead in place)",
+			first.PullStats.Created, first.PullStats.Updated)
+	}
+	// Assert per-bead state right after the first pull: keyed by bare IID,
+	// one bead absorbs both projects' updates (ending on whichever issue is
+	// processed last) and the other is never touched, so at least one bead
+	// holds neither its own issues url nor an updated title.
+	if len(store.issues) != 2 {
+		t.Fatalf("store holds %d issues, want the original two", len(store.issues))
+	}
+	for id, wantRef := range map[string]string{
+		"bd-a7": projectAIssuesRef,
+		"bd-b7": projectBIssuesRef,
+	} {
+		bead := store.issues[id]
+		if bead.ExternalRef == nil || *bead.ExternalRef != wantRef {
+			t.Errorf("%s external_ref = %v after first pull, want its own project's issues url %q", id, derefRef(bead.ExternalRef), wantRef)
+		}
+	}
+
+	second, err := engine.Sync(context.Background(), tracker.SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if second.PullStats.Created != 0 {
+		t.Fatalf("second pull created=%d, want 0", second.PullStats.Created)
+	}
+}
