@@ -2,19 +2,27 @@ package gitlab
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // crossProjectStore is a minimal in-memory tracker.Store for pull tests.
+// SearchIssues lists issues lowest ID first, so a resolver that keeps the
+// first bead per key is deterministic, and AddDependency records the edge.
+// GetIssueByExternalRef reports a miss as a wrapped storage.ErrNotFound, as
+// DoltStore does.
 type crossProjectStore struct {
 	issues map[string]*types.Issue
+	deps   []types.Dependency
 	next   int
 }
 
@@ -31,6 +39,7 @@ func (s *crossProjectStore) SearchIssues(context.Context, string, types.IssueFil
 	for _, iss := range s.issues {
 		out = append(out, iss)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 func (s *crossProjectStore) GetIssueByExternalRef(_ context.Context, ref string) (*types.Issue, error) {
@@ -39,13 +48,19 @@ func (s *crossProjectStore) GetIssueByExternalRef(_ context.Context, ref string)
 			return iss, nil
 		}
 	}
-	return nil, nil
+	return nil, fmt.Errorf("%w: external_ref %s", storage.ErrNotFound, ref)
 }
 func (s *crossProjectStore) GetDependentsWithMetadata(context.Context, string) ([]*types.IssueWithDependencyMetadata, error) {
 	return nil, nil
 }
-func (s *crossProjectStore) GetDependenciesWithMetadata(context.Context, string) ([]*types.IssueWithDependencyMetadata, error) {
-	return nil, nil
+func (s *crossProjectStore) GetDependenciesWithMetadata(_ context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	var out []*types.IssueWithDependencyMetadata
+	for _, dep := range s.deps {
+		if target := s.issues[dep.DependsOnID]; dep.IssueID == issueID && target != nil {
+			out = append(out, &types.IssueWithDependencyMetadata{Issue: *target, DependencyType: dep.Type})
+		}
+	}
+	return out, nil
 }
 func (s *crossProjectStore) CreateIssue(_ context.Context, iss *types.Issue, _ string) error {
 	s.next++
@@ -71,7 +86,8 @@ func (s *crossProjectStore) UpdateIssue(_ context.Context, id string, updates ma
 func (s *crossProjectStore) ApplyIssueUpdate(ctx context.Context, id string, updates map[string]interface{}, _ []string, actor string) error {
 	return s.UpdateIssue(ctx, id, updates, actor)
 }
-func (s *crossProjectStore) AddDependency(context.Context, *types.Dependency, string) error {
+func (s *crossProjectStore) AddDependency(_ context.Context, dep *types.Dependency, _ string) error {
+	s.deps = append(s.deps, *dep)
 	return nil
 }
 
@@ -447,4 +463,432 @@ func TestPull_ProjectlessShorthandBead(t *testing.T) {
 			t.Errorf(`MatchKey("gitlab:7") = %q, want "gitlab:7"`, got)
 		}
 	})
+}
+
+// gitLabProjectIssueJSON renders a GitLab REST issue object that carries its
+// project_id, as the issues API returns it.
+func gitLabProjectIssueJSON(id, iid, projectID int, title, webURL string) string {
+	return `{"id":` + strconv.Itoa(id) + `,"iid":` + strconv.Itoa(iid) + `,"project_id":` + strconv.Itoa(projectID) +
+		`,"title":"` + title + `","state":"opened","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-02T00:00:00Z","web_url":"` + webURL + `"}`
+}
+
+// gitLabLinkJSON renders one entry of the issue-links list API: the linked
+// issue itself, with the link type seen from the listed issue.
+func gitLabLinkJSON(iid, projectID int, webURL, linkType string) string {
+	return `{"iid":` + strconv.Itoa(iid) + `,"project_id":` + strconv.Itoa(projectID) +
+		`,"web_url":"` + webURL + `","link_type":"` + linkType + `"}`
+}
+
+// newGitLabServer answers each API path in routes with a JSON array of its
+// entries, and every other request 404.
+func newGitLabServer(t *testing.T, routes map[string][]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entries, ok := routes[strings.TrimPrefix(r.URL.Path, "/api/v4")]
+		if !ok {
+			http.Error(w, "unexpected", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[" + strings.Join(entries, ",") + "]"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// beadIDByRef returns the ID of the bead linked to ref, or "".
+func beadIDByRef(store *crossProjectStore, ref string) string {
+	for id, iss := range store.issues {
+		if iss.ExternalRef != nil && *iss.ExternalRef == ref {
+			return id
+		}
+	}
+	return ""
+}
+
+// dependencyEdges renders the store's recorded dependencies, sorted.
+func dependencyEdges(store *crossProjectStore) []string {
+	edges := make([]string, 0, len(store.deps))
+	for _, dep := range store.deps {
+		edges = append(edges, dep.IssueID+" -> "+dep.DependsOnID+" "+string(dep.Type))
+	}
+	sort.Strings(edges)
+	return edges
+}
+
+// TestPull_DependencyEndpointsResolveByProject is the dependency-pass form of
+// gastownhall/beads#7795: with a bead linked to project A's issue 7 in the
+// database, pulling project B, whose issue 7 blocks its issue 8, must put the
+// edge on B's beads. Named by bare IID, the endpoint "7" resolved to whichever
+// bead claimed IID 7 first, here project A's.
+func TestPull_DependencyEndpointsResolveByProject(t *testing.T) {
+	const (
+		projectARef7 = "https://gitlab.com/group-a/project-a/-/issues/7"
+		projectBRef7 = "https://gitlab.com/group-b/project-b/-/issues/7"
+		projectBRef8 = "https://gitlab.com/group-b/project-b/-/issues/8"
+	)
+	srv := newGitLabServer(t, map[string][]string{
+		"/projects/200/issues": {
+			gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", projectBRef7),
+			gitLabProjectIssueJSON(9008, 8, 200, "Project B issue 8", projectBRef8),
+		},
+		"/projects/200/issues/7/links": {gitLabLinkJSON(8, 200, projectBRef8, gitLabLinkBlocks)},
+	})
+	tr := &Tracker{client: NewClient("token", srv.URL, "200"), config: DefaultMappingConfig()}
+	aRef := projectARef7
+	store := &crossProjectStore{issues: map[string]*types.Issue{
+		"bd-a7": {ID: "bd-a7", Title: "Project A issue 7", Status: types.StatusOpen, IssueType: types.TypeTask, ExternalRef: &aRef},
+	}}
+
+	if _, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	b7, b8 := beadIDByRef(store, projectBRef7), beadIDByRef(store, projectBRef8)
+	if b7 == "" || b8 == "" {
+		t.Fatalf("pull did not import project B's issues: issue 7 bead %q, issue 8 bead %q", b7, b8)
+	}
+	want := []string{b8 + " -> " + b7 + " blocks"}
+	if got := dependencyEdges(store); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("dependencies = %q, want %q (project A's bead bd-a7 must carry none)", got, want)
+	}
+}
+
+// TestPull_GroupModeDependenciesStayInTheirProject pins link enrichment and
+// endpoints in group mode, where one pull spans project A (id 100) and project
+// B (id 200), which both have an issue 7. Each issue's links are listed in its
+// own project, so B's "7 blocks 8" lands on B's beads and not on A's issue 7,
+// and A#7's link to B#7, two issues with one IID, is an edge between them
+// rather than a dropped self-link.
+func TestPull_GroupModeDependenciesStayInTheirProject(t *testing.T) {
+	const (
+		projectARef7 = "https://gitlab.com/group-a/project-a/-/issues/7"
+		projectBRef7 = "https://gitlab.com/group-b/project-b/-/issues/7"
+		projectBRef8 = "https://gitlab.com/group-b/project-b/-/issues/8"
+	)
+	srv := newGitLabServer(t, map[string][]string{
+		"/groups/30/issues": {
+			gitLabProjectIssueJSON(8007, 7, 100, "Project A issue 7", projectARef7),
+			gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", projectBRef7),
+			gitLabProjectIssueJSON(9008, 8, 200, "Project B issue 8", projectBRef8),
+		},
+		"/projects/100/issues/7/links": {gitLabLinkJSON(7, 200, projectBRef7, gitLabLinkRelatesTo)},
+		"/projects/200/issues/7/links": {gitLabLinkJSON(8, 200, projectBRef8, gitLabLinkBlocks)},
+	})
+	// Project B is the group's default project (gitlab.default_project_id),
+	// the one a configured-project link listing would read for every issue 7.
+	tr := &Tracker{client: NewClient("token", srv.URL, "200").WithGroupID("30"), config: DefaultMappingConfig()}
+	aRef, bRef := projectARef7, projectBRef7
+	store := &crossProjectStore{issues: map[string]*types.Issue{
+		"bd-a7": {ID: "bd-a7", Title: "Project A issue 7", Status: types.StatusOpen, IssueType: types.TypeTask, ExternalRef: &aRef},
+		"bd-b7": {ID: "bd-b7", Title: "Project B issue 7", Status: types.StatusOpen, IssueType: types.TypeTask, ExternalRef: &bRef},
+	}}
+
+	if _, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	b8 := beadIDByRef(store, projectBRef8)
+	if b8 == "" {
+		t.Fatalf("pull did not import project B's issue 8")
+	}
+	want := []string{b8 + " -> bd-b7 blocks", "bd-a7 -> bd-b7 related"}
+	sort.Strings(want)
+	if got := dependencyEdges(store); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("dependencies = %q, want %q", got, want)
+	}
+}
+
+// TestPull_RenamedProjectMatchesBySourceSystem pins the rename-stable pull
+// match. A bead a pull created records its issue's project ID and IID as its
+// source_system; a project rename or transfer changes the issue's URL, which
+// is what MatchKey reads, but neither of those, so the bead is relinked by
+// them. Another project's issue with the same IID is not matched, and neither
+// is a bead whose ref no longer names its source issue on this instance. A
+// bead whose ref is at the path the pull shows the pulled issue's project at,
+// but whose source_system names another project, follows its ref: a pull
+// rewrites the ref and never the source_system, so the issue at that path
+// takes the bead by its path as it would by the exact ref.
+func TestPull_RenamedProjectMatchesBySourceSystem(t *testing.T) {
+	tests := []struct {
+		name         string
+		sourceSystem string
+		stored       string // %s is the configured host:port
+		wantRelinked bool
+	}{
+		{name: "renamed project", sourceSystem: "gitlab:200:7", stored: "http://%s/old-group/project-b/-/issues/7", wantRelinked: true},
+		{name: "transferred nested project", sourceSystem: "gitlab:200:7", stored: "http://%s/old-group/sub/project-b/-/work_items/7", wantRelinked: true},
+		{name: "project-less shorthand", sourceSystem: "gitlab:200:7", stored: "gitlab:7", wantRelinked: true},
+		{name: "other project with the same IID", sourceSystem: "gitlab:100:7", stored: "http://%s/group-a/project-a/-/issues/7"},
+		{name: "other project formerly at the pulled path", sourceSystem: "gitlab:100:7", stored: "http://%s/new-group/project-b/-/work_items/7", wantRelinked: true},
+		{name: "bead relinked to another IID", sourceSystem: "gitlab:200:7", stored: "http://%s/new-group/project-b/-/issues/9"},
+		{name: "bead on another GitLab instance", sourceSystem: "gitlab:200:7", stored: "https://gitlab.other.example/old-group/project-b/-/issues/7"},
+		{name: "renamed project, bead without a source_system", stored: "http://%s/old-group/project-b/-/issues/7"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var webURL string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.TrimPrefix(r.URL.Path, "/api/v4") != "/projects/200/issues/7" {
+					http.Error(w, "unexpected", http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7 (remote)", webURL)))
+			}))
+			t.Cleanup(srv.Close)
+			host := "localhost:" + srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+			webURL = "http://" + host + "/new-group/project-b/-/issues/7"
+			tr := &Tracker{client: NewClient("token", "http://"+host, "200"), config: DefaultMappingConfig()}
+
+			stored := strings.ReplaceAll(tt.stored, "%s", host)
+			store := &crossProjectStore{issues: map[string]*types.Issue{
+				"bd-b7": {ID: "bd-b7", Title: "Local issue 7", Status: types.StatusOpen, IssueType: types.TypeTask,
+					ExternalRef: &stored, SourceSystem: tt.sourceSystem},
+			}}
+			result, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true, IssueIDs: []string{"7"}})
+			if err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+
+			wantCreated, wantUpdated, wantTitle, wantRef, wantBeads := 1, 0, "Local issue 7", stored, 2
+			if tt.wantRelinked {
+				wantCreated, wantUpdated, wantTitle, wantRef, wantBeads = 0, 1, "Project B issue 7 (remote)", webURL, 1
+			}
+			if result.PullStats.Created != wantCreated || result.PullStats.Updated != wantUpdated {
+				t.Errorf("created=%d updated=%d, want created=%d updated=%d",
+					result.PullStats.Created, result.PullStats.Updated, wantCreated, wantUpdated)
+			}
+			b := store.issues["bd-b7"]
+			if b.Title != wantTitle || derefRef(b.ExternalRef) != wantRef {
+				t.Errorf("bd-b7 = {title:%q external_ref:%q}, want {title:%q external_ref:%q}",
+					b.Title, derefRef(b.ExternalRef), wantTitle, wantRef)
+			}
+			if len(store.issues) != wantBeads {
+				t.Errorf("store holds %d beads, want %d", len(store.issues), wantBeads)
+			}
+		})
+	}
+}
+
+// TestPull_GroupModeRelinkedBeadTakesOneIssue pins a bead an older pull
+// relinked (gastownhall/beads#7795): its source_system still names project A's
+// issue 7 while its external_ref is project B's issue 7. A group pull of both
+// issues, in either order, leaves the bead to project B's issue, which its ref
+// names, and gives project A's issue a new bead: no pull lets two issues
+// write one bead.
+func TestPull_GroupModeRelinkedBeadTakesOneIssue(t *testing.T) {
+	for _, bFirst := range []bool{true, false} {
+		name := "project A's issue listed first"
+		if bFirst {
+			name = "project B's issue listed first"
+		}
+		t.Run(name, func(t *testing.T) {
+			routes := map[string][]string{}
+			srv := newGitLabServer(t, routes)
+			refA, refB := srv.URL+"/group-a/project-a/-/issues/7", srv.URL+"/group-b/project-b/-/issues/7"
+			issueA := gitLabProjectIssueJSON(8007, 7, 100, "Project A issue 7", refA)
+			issueB := gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", refB)
+			routes["/groups/30/issues"] = []string{issueA, issueB}
+			if bFirst {
+				routes["/groups/30/issues"] = []string{issueB, issueA}
+			}
+			tr := &Tracker{client: NewClient("token", srv.URL, "").WithGroupID("30"), config: DefaultMappingConfig()}
+			stored := refB
+			store := &crossProjectStore{issues: map[string]*types.Issue{
+				"bd-x": {ID: "bd-x", Title: "Project B issue 7 (stale)", Status: types.StatusOpen, IssueType: types.TypeTask,
+					ExternalRef: &stored, SourceSystem: "gitlab:100:7"},
+			}}
+
+			result, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true})
+			if err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			if result.PullStats.Created != 1 || result.PullStats.Updated != 1 {
+				t.Errorf("created=%d updated=%d, want created=1 updated=1",
+					result.PullStats.Created, result.PullStats.Updated)
+			}
+			if x := store.issues["bd-x"]; x.Title != "Project B issue 7" || derefRef(x.ExternalRef) != refB {
+				t.Errorf("bd-x = {title:%q external_ref:%q}, want project B's issue 7", x.Title, derefRef(x.ExternalRef))
+			}
+			a := beadIDByRef(store, refA)
+			if a == "" || a == "bd-x" || store.issues[a].Title != "Project A issue 7" {
+				t.Errorf("project A's issue 7 bead = %q, want a new bead with its title", a)
+			}
+			if len(store.issues) != 2 {
+				t.Errorf("store holds %d beads, want 2", len(store.issues))
+			}
+		})
+	}
+}
+
+// TestPull_SourceSystemStaleOnAnotherProjectsPath pins when a bead's
+// source_system stops naming it: once a pull sees another project at the
+// bead's ref path, here project B through its issue 8 or through a link to
+// its issue 7, the bead is project B's issue 7's, which its ref names, even
+// with that issue absent from the pull. Project A's issue 7, whose project
+// and IID the bead's source_system still records, gets a new bead.
+func TestPull_SourceSystemStaleOnAnotherProjectsPath(t *testing.T) {
+	tests := []struct {
+		name      string
+		withB8    bool // list project B's issue 8
+		linkToB7  bool // link project A's issue 7 to project B's issue 7
+		wantCount int  // beads the pull creates
+	}{
+		{name: "project B seen through its issue 8", withB8: true, wantCount: 2},
+		{name: "project B seen through a link to its issue 7", linkToB7: true, wantCount: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			routes := map[string][]string{}
+			srv := newGitLabServer(t, routes)
+			refA7 := srv.URL + "/group-a/project-a/-/issues/7"
+			refB7 := srv.URL + "/group-b/project-b/-/issues/7"
+			routes["/groups/30/issues"] = []string{gitLabProjectIssueJSON(8007, 7, 100, "Project A issue 7", refA7)}
+			if tt.withB8 {
+				routes["/groups/30/issues"] = append(routes["/groups/30/issues"],
+					gitLabProjectIssueJSON(9008, 8, 200, "Project B issue 8", srv.URL+"/group-b/project-b/-/issues/8"))
+			}
+			if tt.linkToB7 {
+				routes["/projects/100/issues/7/links"] = []string{gitLabLinkJSON(7, 200, refB7, gitLabLinkRelatesTo)}
+			}
+			tr := &Tracker{client: NewClient("token", srv.URL, "").WithGroupID("30"), config: DefaultMappingConfig()}
+			stored := refB7
+			store := &crossProjectStore{issues: map[string]*types.Issue{
+				"bd-x": {ID: "bd-x", Title: "Project B issue 7", Status: types.StatusOpen, IssueType: types.TypeTask,
+					ExternalRef: &stored, SourceSystem: "gitlab:100:7"},
+			}}
+
+			result, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true})
+			if err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			if result.PullStats.Created != tt.wantCount || result.PullStats.Updated != 0 {
+				t.Errorf("created=%d updated=%d, want created=%d updated=0",
+					result.PullStats.Created, result.PullStats.Updated, tt.wantCount)
+			}
+			if x := store.issues["bd-x"]; x.Title != "Project B issue 7" || derefRef(x.ExternalRef) != refB7 {
+				t.Errorf("bd-x = {title:%q external_ref:%q}, want it left to project B's issue 7", x.Title, derefRef(x.ExternalRef))
+			}
+			a := beadIDByRef(store, refA7)
+			if a == "" || a == "bd-x" {
+				t.Fatalf("project A's issue 7 bead = %q, want a new bead", a)
+			}
+			var want []string
+			if tt.linkToB7 {
+				want = []string{a + " -> bd-x related"}
+			}
+			if got := dependencyEdges(store); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("dependencies = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestPull_RenamedProjectDependencyResolvesByIdentity pins link endpoints after
+// a project rename. Project B's beads still hold its old URLs, and the pull
+// lists only issue 7, whose links say it blocks issue 8: the edge must still
+// reach issue 8's bead, found by the project ID and IID it records, where the
+// link's new URL alone misses it and the edge is dropped.
+func TestPull_RenamedProjectDependencyResolvesByIdentity(t *testing.T) {
+	routes := map[string][]string{}
+	srv := newGitLabServer(t, routes)
+	ref := func(group string, iid int) string {
+		return srv.URL + "/" + group + "/project-b/-/issues/" + strconv.Itoa(iid)
+	}
+	routes["/projects/200/issues"] = []string{gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", ref("new-group", 7))}
+	routes["/projects/200/issues/7/links"] = []string{gitLabLinkJSON(8, 200, ref("new-group", 8), gitLabLinkBlocks)}
+	tr := &Tracker{client: NewClient("token", srv.URL, "200"), config: DefaultMappingConfig()}
+	old7, old8 := ref("old-group", 7), ref("old-group", 8)
+	store := &crossProjectStore{issues: map[string]*types.Issue{
+		"bd-b7": {ID: "bd-b7", Title: "Project B issue 7", Status: types.StatusOpen, IssueType: types.TypeTask,
+			ExternalRef: &old7, SourceSystem: "gitlab:200:7"},
+		"bd-b8": {ID: "bd-b8", Title: "Project B issue 8", Status: types.StatusOpen, IssueType: types.TypeTask,
+			ExternalRef: &old8, SourceSystem: "gitlab:200:8"},
+	}}
+
+	result, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.PullStats.Created != 0 || result.PullStats.Updated != 1 {
+		t.Errorf("created=%d updated=%d, want created=0 updated=1 (bd-b7 relinked)",
+			result.PullStats.Created, result.PullStats.Updated)
+	}
+	want := []string{"bd-b8 -> bd-b7 blocks"}
+	if got := dependencyEdges(store); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("dependencies = %q, want %q", got, want)
+	}
+}
+
+// TestPull_LinkToUnimportedIssueIsNotAFailure pins the dependency pass for a
+// link whose far end has no bead: project B's issue 9, which the pull did not
+// list, and project C's issue 12. The store reports the endpoint's web_url not
+// found, as DoltStore does, and the pass skips the link as one to an issue the
+// pull did not import: no warning and no skip, in a dry run as well.
+func TestPull_LinkToUnimportedIssueIsNotAFailure(t *testing.T) {
+	routes := map[string][]string{}
+	srv := newGitLabServer(t, routes)
+	routes["/projects/200/issues"] = []string{gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", srv.URL+"/group-b/project-b/-/issues/7")}
+	routes["/projects/200/issues/7/links"] = []string{
+		gitLabLinkJSON(9, 200, srv.URL+"/group-b/project-b/-/issues/9", gitLabLinkBlocks),
+		gitLabLinkJSON(12, 300, srv.URL+"/group-c/project-c/-/issues/12", gitLabLinkRelatesTo),
+	}
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dry run %v", dryRun), func(t *testing.T) {
+			tr := &Tracker{client: NewClient("token", srv.URL, "200"), config: DefaultMappingConfig()}
+			store := &crossProjectStore{issues: map[string]*types.Issue{}}
+			result, err := tracker.NewEngine(tr, store, "test").Sync(context.Background(), tracker.SyncOptions{Pull: true, DryRun: dryRun})
+			if err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			if len(result.Warnings) != 0 || result.PullStats.Skipped != 0 {
+				t.Errorf("warnings=%q skipped=%d, want no warning and no skip", result.Warnings, result.PullStats.Skipped)
+			}
+			if got := dependencyEdges(store); len(got) != 0 {
+				t.Errorf("dependencies = %q, want none", got)
+			}
+		})
+	}
+}
+
+// TestPull_DryRunDependencyPreviewUsesMatchedBead pins the dry-run preview of
+// a link to an issue whose bead stores another spelling of its ref, here the
+// work_items URL of issue 7: the preview resolves the endpoint to the bead the
+// pull matches, as the pull does, so it does not propose the edge that bead
+// already has.
+func TestPull_DryRunDependencyPreviewUsesMatchedBead(t *testing.T) {
+	routes := map[string][]string{}
+	srv := newGitLabServer(t, routes)
+	ref := func(kind string, iid int) string {
+		return srv.URL + "/group-b/project-b/-/" + kind + "/" + strconv.Itoa(iid)
+	}
+	routes["/projects/200/issues"] = []string{gitLabProjectIssueJSON(9007, 7, 200, "Project B issue 7", ref("issues", 7))}
+	routes["/projects/200/issues/7/links"] = []string{gitLabLinkJSON(8, 200, ref("issues", 8), gitLabLinkBlocks)}
+	tr := &Tracker{client: NewClient("token", srv.URL, "200"), config: DefaultMappingConfig()}
+	stored7, stored8 := ref("work_items", 7), ref("issues", 8)
+	store := &crossProjectStore{
+		issues: map[string]*types.Issue{
+			"bd-b7": {ID: "bd-b7", Title: "Project B issue 7", Status: types.StatusOpen, IssueType: types.TypeTask, ExternalRef: &stored7},
+			"bd-b8": {ID: "bd-b8", Title: "Project B issue 8", Status: types.StatusOpen, IssueType: types.TypeTask, ExternalRef: &stored8},
+		},
+		deps: []types.Dependency{{IssueID: "bd-b8", DependsOnID: "bd-b7", Type: types.DepBlocks}},
+	}
+	engine := tracker.NewEngine(tr, store, "test")
+	// bd gitlab's pull hooks give every pulled issue a fresh ID.
+	engine.PullHooks = &tracker.PullHooks{GenerateID: func(_ context.Context, issue *types.Issue) error {
+		issue.ID = "bd-gen1"
+		return nil
+	}}
+	var messages []string
+	engine.OnMessage = func(msg string) { messages = append(messages, msg) }
+
+	if _, err := engine.Sync(context.Background(), tracker.SyncOptions{Pull: true, DryRun: true}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	for _, msg := range messages {
+		if strings.Contains(msg, "Would create dependency") {
+			t.Errorf("preview says %q, want no dependency: bd-b8 already depends on bd-b7", msg)
+		}
+	}
 }

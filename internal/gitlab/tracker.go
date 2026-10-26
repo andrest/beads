@@ -39,6 +39,10 @@ type Tracker struct {
 	store       tracker.Store
 	filter      *IssueFilter // Optional filters for issue fetching
 	projectPath string       // GitLab project path (e.g., "socwave/socwave") for GraphQL
+	// projectAt maps a project path, keyed as MatchKey keys it without the
+	// IID, to the project ID GitLab reported for an issue or link fetched at
+	// that path. LocalIdentityKey reads it.
+	projectAt map[string]int
 }
 
 func (t *Tracker) Name() string         { return "gitlab" }
@@ -156,12 +160,21 @@ func (t *Tracker) FetchIssues(ctx context.Context, opts tracker.FetchOptions) ([
 		return nil, err
 	}
 
-	// Enrich each issue with its links (dependencies).
+	// Enrich each issue with its links (dependencies), listed in the issue's
+	// own project: a group pull spans projects whose IIDs repeat.
 	for i := range issues {
-		links, err := t.client.GetIssueLinks(ctx, issues[i].IID)
+		t.noteProject(issues[i].WebURL, issues[i].ProjectID)
+		project := t.client.ProjectID
+		if issues[i].ProjectID > 0 {
+			project = strconv.Itoa(issues[i].ProjectID)
+		}
+		links, err := t.client.GetProjectIssueLinks(ctx, project, issues[i].IID)
 		if err != nil {
-			// Non-fatal: issue may lack link permissions or be in a different project.
+			// Non-fatal: the token may lack permission to read the issue's links.
 			continue
+		}
+		for _, link := range links {
+			t.noteProject(link.WebURL, link.ProjectID)
 		}
 		issues[i].IssueLinksData = links
 	}
@@ -198,6 +211,7 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 	if gl == nil {
 		return nil, nil
 	}
+	t.noteProject(gl.WebURL, gl.ProjectID)
 
 	ti := gitlabToTrackerIssue(gl)
 	return &ti, nil
@@ -583,17 +597,28 @@ func (t *Tracker) ExtractIdentifier(ref string) string {
 // issue URL, at worst duplicated by the next pull.
 func (t *Tracker) MatchKey(ref string) string {
 	if m := glShorthandPattern.FindStringSubmatch(ref); len(m) >= 2 {
-		project := t.matchKeyProjectPath()
-		if project == "" || t.client == nil {
+		project := t.configuredMatchKeyProject()
+		if project == "" {
 			return ref
 		}
-		host, basePath, ok := canonicalGitLabURL(t.client.BaseURL)
-		if !ok {
-			return ref
-		}
-		return "gl://" + host + basePath + "/" + project + "#" + m[1]
+		return project + "#" + m[1]
 	}
 	return matchKeyFromURL(ref)
+}
+
+// configuredMatchKeyProject returns the configured project keyed as MatchKey
+// keys a ref's project, "gl://{host}/{path}" on the gitlab.url host, or ""
+// when the project is only known by numeric ID.
+func (t *Tracker) configuredMatchKeyProject() string {
+	project := t.matchKeyProjectPath()
+	if project == "" || t.client == nil {
+		return ""
+	}
+	host, basePath, ok := canonicalGitLabURL(t.client.BaseURL)
+	if !ok {
+		return ""
+	}
+	return "gl://" + host + basePath + "/" + project
 }
 
 // matchKeyProjectPath returns the configured project's canonical path, or ""
@@ -608,6 +633,68 @@ func (t *Tracker) matchKeyProjectPath() string {
 		return ""
 	}
 	return project
+}
+
+// LocalIdentityKey implements tracker.IdentityKeyer. A pulled issue's bead
+// records the issue's project ID and IID as its source_system, and a project
+// rename or transfer changes neither, while it changes the project path that
+// MatchKey reads from the URL. The source_system identifies the bead only
+// while its external_ref still names that IID on the configured instance, in
+// a project path no issue or link fetched in this sync showed to be another
+// project's. A pull rewrites external_ref but never source_system, so a bead
+// relinked to another issue (by hand, or by an older pull that matched another
+// project's issue with the same IID) or linked to another GitLab instance
+// (whose project IDs are its own) keeps its MatchKey fallback.
+func (t *Tracker) LocalIdentityKey(issue *types.Issue) string {
+	if issue == nil || issue.ExternalRef == nil {
+		return ""
+	}
+	m := sourceSystemPattern.FindStringSubmatch(issue.SourceSystem)
+	if m == nil {
+		return ""
+	}
+	ref := strings.TrimSpace(*issue.ExternalRef)
+	if !glShorthandPattern.MatchString(ref) && !t.onConfiguredHost(ref) {
+		return ""
+	}
+	if t.ExtractIdentifier(ref) != m[2] || t.refInOtherProject(ref, m[1]) {
+		return ""
+	}
+	return issue.SourceSystem
+}
+
+// RemoteIdentityKey implements tracker.IdentityKeyer: the source_system a pull
+// records for the issue, "" when GitLab sent no project ID.
+func (t *Tracker) RemoteIdentityKey(issue *tracker.TrackerIssue) string {
+	gl, ok := issue.Raw.(*Issue)
+	if !ok || gl == nil {
+		return ""
+	}
+	return gitLabIdentityKey(gl.ProjectID, gl.IID)
+}
+
+// noteProject records that GitLab reported projectID for the issue at webURL,
+// whose path is that project's current path.
+func (t *Tracker) noteProject(webURL string, projectID int) {
+	project, _, ok := strings.Cut(matchKeyFromURL(webURL), "#")
+	if !ok || projectID <= 0 {
+		return
+	}
+	if t.projectAt == nil {
+		t.projectAt = make(map[string]int)
+	}
+	t.projectAt[project] = projectID
+}
+
+// refInOtherProject reports whether an issue or link fetched in this sync
+// showed ref's project path to be the path of a project other than projectID.
+func (t *Tracker) refInOtherProject(ref, projectID string) bool {
+	project, _, ok := strings.Cut(t.MatchKey(ref), "#")
+	if !ok {
+		return false
+	}
+	seen, ok := t.projectAt[project]
+	return ok && strconv.Itoa(seen) != projectID
 }
 
 func parseMilestoneIdentifier(identifier string) (int, bool, error) {

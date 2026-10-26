@@ -83,6 +83,20 @@ type MatchKeyer interface {
 	MatchKey(ref string) string
 }
 
+// IdentityKeyer is implemented by trackers that record a rename-stable
+// identity on the issues a pull imports (GitLab: project ID and IID, which a
+// project rename or transfer does not change, unlike the URL MatchKey reads).
+// When the exact external_ref lookup misses, a pulled issue is matched to the
+// local issue with the same identity key; a local issue that has one takes no
+// MatchKey fallback. "" means no identity. A key that two local issues hold
+// matches neither. The engine asks for local keys after fetching the pull's
+// issues, so LocalIdentityKey may judge a recorded identity stale by what
+// they showed (GitLab: the ref's project path belongs to another project).
+type IdentityKeyer interface {
+	LocalIdentityKey(issue *types.Issue) string
+	RemoteIdentityKey(issue *TrackerIssue) string
+}
+
 // FieldMapper handles bidirectional conversion of issue fields between
 // an external tracker and beads. Each tracker provides its own mapper.
 type FieldMapper interface {
