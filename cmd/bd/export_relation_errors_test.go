@@ -92,6 +92,20 @@ func (s *failingExportRelationStore) GetDependencyCounts(context.Context, []stri
 	return map[string]*types.DependencyCounts{}, nil
 }
 
+// exportRelationSeed is a previous export of the stub's one issue, with its
+// label: an in-scope record every auto-export guard lets through, so a
+// failing write gets as far as the relation loaders.
+const exportRelationSeed = `{"id":"bd-export1","title":"export me","status":"open","issue_type":"task","labels":["keep"]}` + "\n"
+
+// assertFileUnchanged checks that path still holds exactly want.
+func assertFileUnchanged(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != want {
+		t.Fatalf("%s changed: got %q (err %v), want %q", path, got, err, want)
+	}
+}
+
 // assertRelationLoaderErr checks that err wraps the failing loader's sentinel
 // behind its uow-aligned prefix, not merely that it mentions the loader.
 func assertRelationLoaderErr(t *testing.T, path string, err, sentinel error, wantPrefix string) {
@@ -116,6 +130,29 @@ func TestClassicExportPathsRejectRelationLoaderFailures(t *testing.T) {
 
 			_, err := storeExportSource{}.LoadExportRelations(t.Context(), issues)
 			assertRelationLoaderErr(t, "LoadExportRelations", err, loader.sentinel, loader.wantPrefix)
+
+			// Full auto-export writer over a previous export: the atomic
+			// temp file is aborted, so the old JSONL survives byte for byte
+			// and nothing else is left beside it.
+			dir := t.TempDir()
+			out := filepath.Join(dir, "issues.jsonl")
+			if err := os.WriteFile(out, []byte(exportRelationSeed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = exportToFile(t.Context(), out, false)
+			assertRelationLoaderErr(t, "exportToFile", err, loader.sentinel, loader.wantPrefix)
+			assertFileUnchanged(t, out, exportRelationSeed)
+			if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) != 1 {
+				t.Fatalf("export dir entries = %v (err %v), want only issues.jsonl", entries, readErr)
+			}
+
+			// ...and with no previous export, none is published.
+			absent := filepath.Join(t.TempDir(), "issues.jsonl")
+			_, _, err = exportToFile(t.Context(), absent, false)
+			assertRelationLoaderErr(t, "exportToFile (absent)", err, loader.sentinel, loader.wantPrefix)
+			if _, statErr := os.Stat(absent); !os.IsNotExist(statErr) {
+				t.Fatalf("failed export published %q: stat err = %v", absent, statErr)
+			}
 		})
 	}
 }
@@ -144,12 +181,11 @@ func useClassicExportStore(t *testing.T, s storage.DoltStorage) {
 // `bd export`: a failing relation loader exits non-zero before any record is
 // written, prints no success summary, and leaves the -o target untouched.
 func TestRunExportFailsWhenRelationLoaderFails(t *testing.T) {
-	const seed = `{"id":"bd-export1","title":"export me","status":"open","issue_type":"task","labels":["keep"]}` + "\n"
 	for _, loader := range exportRelationLoaders {
 		t.Run(loader.name, func(t *testing.T) {
 			useClassicExportStore(t, &failingExportRelationStore{fail: loader.name})
 			exportOutput = filepath.Join(t.TempDir(), "issues.jsonl")
-			if err := os.WriteFile(exportOutput, []byte(seed), 0o600); err != nil {
+			if err := os.WriteFile(exportOutput, []byte(exportRelationSeed), 0o600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -164,9 +200,7 @@ func TestRunExportFailsWhenRelationLoaderFails(t *testing.T) {
 			if strings.Contains(stderr, "Exported") {
 				t.Fatalf("stderr = %q, want no export summary", stderr)
 			}
-			if got, readErr := os.ReadFile(exportOutput); readErr != nil || string(got) != seed {
-				t.Fatalf("export target changed: got %q (err %v), want %q", got, readErr, seed)
-			}
+			assertFileUnchanged(t, exportOutput, exportRelationSeed)
 		})
 	}
 

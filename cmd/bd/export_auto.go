@@ -716,7 +716,8 @@ func buildAutoExportFilter(ctx context.Context) (types.IssueFilter, map[string]b
 
 // exportToFile atomically exports issues + memories to the given file path.
 // Writes to a temp file first, then renames into place so readers never see
-// a partial or truncated export. Used by both `bd export -o` and auto-export.
+// a partial or truncated export. This is the full auto-export writer;
+// `bd export -o` goes through runExport and its exportSource instead.
 func exportToFile(ctx context.Context, path string, includeMemories bool) (issueCount, memoryCount int, err error) {
 	w, err := atomicfile.Create(path, 0o644)
 	if err != nil {
@@ -765,22 +766,23 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 		for i, issue := range issues {
 			issueIDs[i] = issue.ID
 		}
-		labelsMap, _ := store.GetLabelsForIssues(ctx, issueIDs)
-		allDeps, _ := store.GetDependencyRecordsForIssues(ctx, issueIDs)
-		commentsMap, _ := store.GetCommentsForIssues(ctx, issueIDs)
-		commentCounts, _ := store.GetCommentCounts(ctx, issueIDs)
-		depCounts, _ := store.GetDependencyCounts(ctx, issueIDs)
+		// Returned explicitly so the named err is set and the deferred
+		// Abort drops the temp file, keeping the previous export (GH#6870).
+		relations, err := loadClassicExportRelations(ctx, issueIDs)
+		if err != nil {
+			return 0, 0, err
+		}
 
 		for _, issue := range issues {
-			issue.Labels = labelsMap[issue.ID]
-			issue.Dependencies = allDeps[issue.ID]
-			issue.Comments = commentsMap[issue.ID]
+			issue.Labels = relations.labels[issue.ID]
+			issue.Dependencies = relations.deps[issue.ID]
+			issue.Comments = relations.comments[issue.ID]
 		}
 
 		// Write issues
 		enc := json.NewEncoder(w)
 		for _, issue := range issues {
-			counts := depCounts[issue.ID]
+			counts := relations.depCounts[issue.ID]
 			if counts == nil {
 				counts = &types.DependencyCounts{}
 			}
@@ -791,7 +793,7 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 					Issue:           issue,
 					DependencyCount: counts.DependencyCount,
 					DependentCount:  counts.DependentCount,
-					CommentCount:    commentCounts[issue.ID],
+					CommentCount:    relations.commentCounts[issue.ID],
 				},
 			}
 			if err := enc.Encode(record); err != nil {
