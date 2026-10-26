@@ -47,8 +47,9 @@ func setupTestRepo(t *testing.T) (repoPath string, cleanup func()) {
 
 // TestSetupTestRepoIgnoresInheritedGitLocation pins that the fixture stays in
 // its own t.TempDir() when a test points the git location keys at another
-// repository after TestMain's scrub (gastownhall/beads#7706): gitCommand has to
-// drop them per command, because TestMain cannot see a later t.Setenv.
+// repository with t.Setenv (gastownhall/beads#7706): gitCommand has to drop
+// them per command, because a package TestMain scrub cannot see a later
+// t.Setenv.
 func TestSetupTestRepoIgnoresInheritedGitLocation(t *testing.T) {
 	decoy := newDecoyRepo(t)
 	before := snapshotDecoy(t, decoy)

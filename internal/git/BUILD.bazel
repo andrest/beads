@@ -17,14 +17,11 @@ go_test(
     srcs = [
         "discover_linux_test.go",
         "gitdir_test.go",
+        "inherited_location_test.go",
         "jujutsu_test.go",
-        "testmain_test.go",
     ],
     embed = [":git"],
-    deps = [
-        "//internal/testutil",
-        "//internal/testutil/bazeltest",
-    ],
+    deps = ["//internal/testutil"],
 )
 
 # --- begin repo_files (managed by tools/bazel/go_srcs.py; run `make bazel-sync`) ---
