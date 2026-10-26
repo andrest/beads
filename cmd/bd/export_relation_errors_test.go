@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -243,4 +244,86 @@ func TestRunExportFailsWhenRelationLoaderFails(t *testing.T) {
 			t.Fatalf("stdout = %q, want no records", stdout)
 		}
 	})
+}
+
+// GetCurrentCommit doubles as the auto-export state hash (the stub is no
+// storage.StateHasher) and the diff anchor.
+func (s *failingExportRelationStore) GetCurrentCommit(context.Context) (string, error) {
+	return "hash-after-write", nil
+}
+
+// failingDiffExportRelationStore adds storage.DiffStore so auto-export takes
+// the incremental path (encodeIssueRecords) before its full fallback.
+type failingDiffExportRelationStore struct {
+	*failingExportRelationStore
+}
+
+func (s *failingDiffExportRelationStore) ChangedIssueIDs(context.Context, string, string) (storage.ChangedIssueIDs, error) {
+	return storage.ChangedIssueIDs{Upserted: []string{"bd-export1"}}, nil
+}
+
+func (s *failingDiffExportRelationStore) GetIssuesByIDs(ctx context.Context, _ []string) ([]*types.Issue, error) {
+	return s.SearchIssues(ctx, "", types.IssueFilter{})
+}
+
+// TestMaybeAutoExportKeepsJSONLWhenRelationLoaderFails pins GH#6870 on
+// auto-export: a failing relation loader leaves the triggering command
+// successful, warns, keeps the previous JSONL byte for byte, and does not
+// advance export-state.json, so the next write command retries.
+func TestMaybeAutoExportKeepsJSONLWhenRelationLoaderFails(t *testing.T) {
+	cases := []struct {
+		name       string
+		store      func() storage.DoltStorage
+		diffAnchor string
+	}{
+		{
+			name:  "full",
+			store: func() storage.DoltStorage { return &failingExportRelationStore{fail: "labels"} },
+		},
+		{
+			name: "incremental then full",
+			store: func() storage.DoltStorage {
+				return &failingDiffExportRelationStore{&failingExportRelationStore{fail: "labels"}}
+			},
+			diffAnchor: "anchor-before-write",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			initConfigForTest(t)
+			config.Set("export.auto", true)
+			saveAndRestoreGlobals(t)
+			t.Setenv("BD_GIT_HOOK", "")
+			store = tc.store()
+
+			dir := t.TempDir()
+			beadsDir := filepath.Join(dir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"database":"beads","backend":"dolt"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(dir)
+			t.Setenv("BEADS_DIR", beadsDir)
+			jsonl := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(jsonl, []byte(exportRelationSeed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			saveExportAutoState(beadsDir, &exportAutoState{LastDoltCommit: "hash-before-write", LastDiffAnchor: tc.diffAnchor})
+
+			var err error
+			stderr := captureStderr(t, func() { err = maybeAutoExport(t.Context(), false) })
+			if err != nil {
+				t.Fatalf("maybeAutoExport err = %v, want nil (the triggering command must still succeed)", err)
+			}
+			if n := strings.Count(stderr, "Warning: auto-export failed: load labels: "); n != 1 {
+				t.Fatalf("stderr = %q, want exactly one auto-export failure warning naming load labels", stderr)
+			}
+			assertFileUnchanged(t, jsonl, exportRelationSeed)
+			if got := loadExportAutoState(beadsDir); got.LastDoltCommit != "hash-before-write" || got.LastDiffAnchor != tc.diffAnchor {
+				t.Fatalf("export state advanced to commit %q anchor %q, want %q / %q", got.LastDoltCommit, got.LastDiffAnchor, "hash-before-write", tc.diffAnchor)
+			}
+		})
+	}
 }
