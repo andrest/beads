@@ -533,6 +533,7 @@ func isDoltProcess(pid int) bool {
 func doltProcessStatus(pid int) (isDolt, known bool) {
 	pids, err := readDoltProcesses()
 	if err != nil {
+		debug.Logf("cannot confirm PID %d is a dolt sql-server: %v\n", pid, err)
 		return false, false
 	}
 	for _, p := range pids {
@@ -679,10 +680,10 @@ func ReadPortFile(beadsDir string) int {
 // inherited its PID number, AND the port file still names the port some other
 // server now answers on. It fails toward "owned" only when all three coincide.
 // Note that isDoltProcess here would close only this gap, not the adopted-server
-// one — reclaimPort already requires isDoltProcess before it will adopt. On
-// unix the liveness check also counts a PID this user may not signal (EPERM)
-// as alive, so a recorded PID recycled to another account's process passes it
-// too.
+// one — reclaimPort already requires isDoltProcess before it will adopt. The
+// liveness check here is the strict one: a PID this user may not signal
+// (EPERM), such as a recorded PID recycled to another account's process, fails
+// it, although IsRunning counts that process as alive.
 //
 // Callers needing certainty over latency should use IsRunning, or
 // IsTrackedServerRunning when they must not mutate the state files.
@@ -703,14 +704,16 @@ func ManagesLiveServerOnPort(beadsDir string, port int) bool {
 	if err != nil || pid <= 0 {
 		return false
 	}
-	return isProcessAlive(pid)
+	return isSignalableProcess(pid)
 }
 
 // IsTrackedServerRunning reports whether beadsDir's state files name a
 // running dolt sql-server: the port file holds a port, and the PID file a live
 // process that isDoltProcess accepts. With a port file present that is when
 // IsRunning reports Running, so Start reports the tracked server instead of
-// initializing the data dir and launching one.
+// initializing the data dir and launching one. The exception is a process list
+// that cannot be read: IsRunning then reports the tracked server as Running
+// (GH#7214), while this answers false, the refusing direction for its caller.
 //
 // Read-only, unlike IsRunning, which deletes the state files of a PID that is
 // dead or not dolt and can stop a server whose port it cannot determine.
@@ -1224,7 +1227,9 @@ func defaultConfigForMode(beadsDir string, sharedMode bool, resolvePort serverPo
 }
 
 // IsRunning checks if a managed server is running for this beadsDir.
-// Returns a State with Running=true if a valid dolt process is found.
+// Returns a State with Running=true if the PID file names a live dolt process,
+// or a live process the process list could not be read to verify, provided the
+// port file records its port (GH#7214).
 func IsRunning(beadsDir string) (*State, error) {
 	data, err := os.ReadFile(pidPath(beadsDir))
 	if err != nil {
@@ -1258,7 +1263,8 @@ func IsRunning(beadsDir string) (*State, error) {
 	// server, and reporting it as not running would make our caller start one
 	// and overwrite them, so keep the tracked state and let the caller find out
 	// whether it can connect. A stale file whose PID was reused then stays
-	// until a bd that can read the process list checks it.
+	// until a bd that can read the process list checks it, or until the
+	// operator removes it as Stop's refusal explains.
 	isDolt, known := doltProcessStatus(pid)
 	if known && !isDolt {
 		// The list was read and lacks the PID: it was reused by another process.
@@ -1267,22 +1273,36 @@ func IsRunning(beadsDir string) (*State, error) {
 		return &State{Running: false}, nil
 	}
 
-	// Read actual port from port file; fall back to config-derived port.
+	// Read actual port from port file; for a confirmed dolt server, fall back
+	// to the config-derived port.
 	port := readPortFile(beadsDir)
+	if port == 0 && !known {
+		// Neither the process nor its port can be confirmed. A configured port
+		// (BEADS_DOLT_SERVER_PORT, the shared server's) says where a server
+		// should listen, not that this PID is one, so only the port file Start
+		// writes beside the pid file counts. Never signal a PID that may belong
+		// to an unrelated process; leave its pid file alone too, as nothing
+		// shows it is stale. With no port recorded, no other bd process
+		// reaches a server through these files, so report not running and let
+		// the caller act as it did before GH#7214: a start replaces the pid
+		// file with the server it launches, and Stop removes it without
+		// signaling the PID.
+		return &State{Running: false}, nil
+	}
 	if port == 0 {
 		cfg := DefaultConfig(beadsDir)
 		port = cfg.Port
-	}
-	if port == 0 && !known {
-		// Neither the process nor its port can be confirmed. Never signal a
-		// PID that may belong to an unrelated process, and keep the pid file
-		// for a bd that can read the process list.
-		return &State{Running: false}, nil
 	}
 	if port == 0 {
 		// Server is running but we can't determine its port (port file
 		// missing, no explicit config). Stop the orphan so that callers
 		// (EnsureRunning) trigger a fresh Start() with a new port file.
+		if !isSignalableProcess(pid) {
+			// Signal 0 answered EPERM: the process is alive, but no signal
+			// from this user reaches it. Leave its pid file, as for an
+			// unverified PID above: a start replaces it.
+			return &State{Running: false}, nil
+		}
 		fmt.Fprintf(os.Stderr, "Dolt server (PID %d) running but port unknown; stopping for restart\n", pid)
 		if err := gracefulStop(pid, 5*time.Second); err != nil {
 			// Best-effort kill
@@ -2239,7 +2259,11 @@ func stopLocked(beadsDir string) error {
 	}
 	if !state.Running {
 		// Server not running — still clean up any leftover state files
-		// so bd dolt status won't report stale state (GH#2670).
+		// so bd dolt status won't report stale state (GH#2670). That
+		// includes the pid file IsRunning leaves for a live PID it could not
+		// verify and has no port file for (GH#7214): the PID is not signaled,
+		// and with no port recorded no other bd process reaches a server
+		// through that file.
 		// Join cleanup errors with the sentinel so callers can still use
 		// errors.Is(err, ErrServerNotRunning) while operators see filesystem issues.
 		cleanupErr := cleanupStateFiles(beadsDir)
@@ -2249,13 +2273,22 @@ func stopLocked(beadsDir string) error {
 	// IsRunning keeps the tracked state when the process list cannot be read
 	// (GH#7214), so the PID is not confirmed to be a dolt server and may be a
 	// stale PID reused by an unrelated process. Do not flush or signal it, and
-	// leave the files for a bd that can read the process list.
+	// leave the files for a bd that can read the process list. The exception
+	// is a server this process launched, such as one newServerMode's
+	// auto-start started and then declined (GH#4052): stop it, or the port
+	// file that newServerMode restores would sit beside that server's pid file.
 	isDolt, known := doltProcessStatus(state.PID)
+	if !known && launchedHere(state.PID) {
+		isDolt, known = true, true
+	}
 	if !known {
 		return fmt.Errorf("not stopping PID %d: the process list could not be read, "+
 			"so it is not confirmed to be a dolt sql-server.\n"+
 			"Run 'bd dolt stop' where the process list can be read, or confirm PID %d "+
-			"is a dolt sql-server (%s) and stop it yourself", state.PID, state.PID, processListHint)
+			"is a dolt sql-server (%s) and stop it yourself.\n"+
+			"If PID %d is not a dolt sql-server, the server recorded here is gone: "+
+			"remove %s and %s",
+			state.PID, state.PID, processListHint, state.PID, pidPath(beadsDir), portPath(beadsDir))
 	}
 	if !isDolt {
 		// The list is read again here, so it can be readable now even though it

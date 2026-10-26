@@ -338,21 +338,44 @@ func TestIsRunningRemovesStateWhenPIDIsNotDolt(t *testing.T) {
 	}
 }
 
+// With no port file, a port from config (BEADS_DOLT_SERVER_PORT, or the
+// shared server's) does not confirm an unverified PID either: it says where a
+// server should listen, not that this PID is one.
 func TestIsRunningDoesNotStopUnverifiedProcessWithoutPort(t *testing.T) {
-	dir := t.TempDir()
-	// The PID is this test process: the orphan-stop path would kill the test.
-	writeTrackedStateForLiveProcess(t, dir, 0)
-	stubProcessList(t, func() ([]int, error) { return nil, errProcessListUnreadable })
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"no port configured", nil},
+		{"port from BEADS_DOLT_SERVER_PORT", map[string]string{"BEADS_DOLT_SERVER_PORT": "14568"}},
+		{"shared server mode", map[string]string{"BEADS_DOLT_SHARED_SERVER": "1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// The PID is this test process: the orphan-stop path would kill the test.
+			writeTrackedStateForLiveProcess(t, dir, 0)
+			t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+			t.Setenv("BEADS_SHARED_SERVER_DIR", t.TempDir())
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			if tt.env != nil && DefaultConfig(dir).Port == 0 {
+				t.Fatal("precondition: DefaultConfig resolved no port")
+			}
+			stubProcessList(t, func() ([]int, error) { return nil, errProcessListUnreadable })
 
-	state, err := IsRunning(dir)
-	if err != nil {
-		t.Fatalf("IsRunning error: %v", err)
-	}
-	if state.Running {
-		t.Errorf("IsRunning = %+v, want Running=false when neither the process nor its port can be confirmed", state)
-	}
-	if _, err := os.Stat(pidPath(dir)); err != nil {
-		t.Errorf("expected the pid file to be kept: %v", err)
+			state, err := IsRunning(dir)
+			if err != nil {
+				t.Fatalf("IsRunning error: %v", err)
+			}
+			if state.Running {
+				t.Errorf("IsRunning = %+v, want Running=false when neither the process nor its port can be confirmed", state)
+			}
+			if _, err := os.Stat(pidPath(dir)); err != nil {
+				t.Errorf("expected the pid file to be kept: %v", err)
+			}
+		})
 	}
 }
 

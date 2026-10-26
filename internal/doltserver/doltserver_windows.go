@@ -113,6 +113,12 @@ func isProcessAlive(pid int) bool {
 	return err == nil && status == uint32(windows.WAIT_TIMEOUT)
 }
 
+// isSignalableProcess is isProcessAlive on Windows, which already answers
+// false for a process this user may not open.
+func isSignalableProcess(pid int) bool {
+	return isProcessAlive(pid)
+}
+
 // gracefulStop terminates a process on Windows. Uses TerminateProcess (hard kill)
 // directly. Data safety comes from FlushWorkingSet which runs in StopWithForce
 // before calling gracefulStop. The Unix SIGTERM is a courtesy; the real protection

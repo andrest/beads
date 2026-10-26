@@ -21,7 +21,7 @@ const portConflictHint = "lsof -i :%d"
 
 // processListHint is the platform-specific command to list dolt processes.
 // Used in error messages when too many dolt servers are running.
-const processListHint = "pgrep -la 'dolt sql-server'"
+const processListHint = "pgrep -fl 'dolt sql-server'"
 
 // procAttrDetached is defined per-platform in procattr_linux.go (Linux) and
 // procattr_other_unix.go (darwin/BSD): Pdeathsig, used to test-gate
@@ -126,15 +126,29 @@ func isProcessInDir(pid int, dir string) bool {
 	return false
 }
 
+// signalZero sends signal 0 to pid, which checks the process without
+// signaling it. It is a variable so tests can simulate a process this user may
+// not signal.
+var signalZero = func(pid int) error {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Signal(syscall.Signal(0))
+}
+
 // isProcessAlive checks if a process with the given PID is running.
 // Uses signal 0 which doesn't send a signal but checks process existence.
 // A process this user may not signal still exists, so it counts as alive.
 func isProcessAlive(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return aliveAfterSignalZero(process.Signal(syscall.Signal(0)))
+	return aliveAfterSignalZero(signalZero(pid))
+}
+
+// isSignalableProcess reports whether pid is a live process this user may
+// signal. Unlike isProcessAlive it is false for a process that belongs to
+// another account (EPERM).
+func isSignalableProcess(pid int) bool {
+	return signalZero(pid) == nil
 }
 
 // aliveAfterSignalZero classifies the error from signaling a process with
