@@ -35,6 +35,8 @@ type installShOptions struct {
 	readOnlyDir bool
 	// fail is "cp" or "mv": that wrapper fails the staged copy or the rename.
 	fail string
+	// umask, when set, is the umask install_from_release runs under.
+	umask string
 }
 
 type installShRun struct {
@@ -43,22 +45,25 @@ type installShRun struct {
 	calls      [][]string
 	pid        string
 	extracted  string
-	tmpRoot    string
 	installDir string
 }
 
 // runInstallShRelease drives install_from_release from a temp copy of
-// scripts/install.sh with stubbed curl/tar/uname/sudo and logging cp/mv
-// wrappers. It sources the copy and calls the function directly: running
-// main would fall back to `go install` from the network when the release
-// install fails.
+// scripts/install.sh with stubbed curl/tar/uname/sudo and logging
+// cp/chmod/mv wrappers. It sources the copy and calls the function directly:
+// running main would fall back to `go install` from the network when the
+// release install fails.
 func runInstallShRelease(t *testing.T, opts installShOptions) installShRun {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("scripts/install.sh is the Unix installer")
 	}
+	if opts.readOnlyDir && os.Geteuid() == 0 {
+		t.Skip("bash [[ -w ]] is true for root, so the sudo branch is never taken")
+	}
 	bash := requireHostTool(t, "bash")
 	realCP := requireHostTool(t, "cp")
+	realChmod := requireHostTool(t, "chmod")
 	realMV := requireHostTool(t, "mv")
 
 	bin := t.TempDir()
@@ -70,7 +75,12 @@ func runInstallShRelease(t *testing.T, opts installShOptions) installShRun {
 	if err := os.Mkdir(installDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(installDir, "bd"), []byte(installShOldBD), 0o755); err != nil {
+	oldBD := filepath.Join(installDir, "bd")
+	if err := os.WriteFile(oldBD, []byte(installShOldBD), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile applies this process's umask; requireBD wants exactly 0755.
+	if err := os.Chmod(oldBD, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if opts.readOnlyDir {
@@ -136,7 +146,7 @@ esac
 set -eu
 printf '%s\n' "$PWD" >"$INSTALL_TEST_STATE/tar-cwd"
 cat "$INSTALL_TEST_FIXTURES/bd" >bd
-chmod 755 bd
+"$INSTALL_TEST_REAL_CHMOD" 755 bd
 `)
 	writeExecutable(t, filepath.Join(bin, "uname"), `#!/bin/sh
 set -eu
@@ -146,11 +156,19 @@ case "${1:-}" in
 esac
 `)
 	// The sudo stub grants the test-owned dir write access instead of
-	// privilege, then runs the command, so the real tools still move bytes.
+	// privilege for one command, then takes it back, so the real tools still
+	// move bytes and a command run without sudo still meets a read-only dir.
 	writeExecutable(t, filepath.Join(bin, "sudo"), `#!/bin/sh
 { printf 'sudo'; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >>"$INSTALL_TEST_CALL_LOG"
-chmod u+w "$INSTALL_TEST_DIR"
-exec "$@"
+"$INSTALL_TEST_REAL_CHMOD" u+w "$INSTALL_TEST_DIR"
+"$@"
+rc=$?
+"$INSTALL_TEST_REAL_CHMOD" u-w "$INSTALL_TEST_DIR"
+exit "$rc"
+`)
+	writeExecutable(t, filepath.Join(bin, "chmod"), `#!/bin/sh
+{ printf 'chmod'; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >>"$INSTALL_TEST_CALL_LOG"
+exec "$INSTALL_TEST_REAL_CHMOD" "$@"
 `)
 	writeExecutable(t, filepath.Join(bin, "cp"), `#!/bin/sh
 { printf 'cp'; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >>"$INSTALL_TEST_CALL_LOG"
@@ -189,10 +207,12 @@ exec "$INSTALL_TEST_REAL_MV" "$@"
 		"INSTALL_TEST_STATE=" + state,
 		"INSTALL_TEST_CALL_LOG=" + callLog,
 		"INSTALL_TEST_REAL_CP=" + realCP,
+		"INSTALL_TEST_REAL_CHMOD=" + realChmod,
 		"INSTALL_TEST_REAL_MV=" + realMV,
 		"INSTALL_TEST_FAIL=" + opts.fail,
+		"INSTALL_TEST_UMASK=" + opts.umask,
 	}
-	for _, name := range []string{"curl", "tar", "uname", "sudo", "cp", "mv"} {
+	for _, name := range []string{"curl", "tar", "uname", "sudo", "cp", "chmod", "mv"} {
 		requireShellCommandPath(t, bash, work, env, name, bin+"/"+name)
 	}
 
@@ -201,6 +221,7 @@ exec "$INSTALL_TEST_REAL_MV" "$@"
 	driver := `PATH="$BEADS_TEST_COMMAND_PATH"; export PATH
 source "$1"
 set +e
+if [ -n "$INSTALL_TEST_UMASK" ]; then umask "$INSTALL_TEST_UMASK"; fi
 printf '%s\n' "$$" >"$2"
 install_from_release linux_amd64
 `
@@ -208,7 +229,7 @@ install_from_release linux_amd64
 	cmd.Dir = work
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
-	run := installShRun{output: string(out), tmpRoot: tmpRoot, installDir: installDir}
+	run := installShRun{output: string(out), installDir: installDir}
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
@@ -227,9 +248,18 @@ install_from_release linux_amd64
 	if err != nil {
 		t.Fatalf("tar stub never ran: %v\n%s", err, out)
 	}
-	run.extracted = strings.TrimSpace(string(tarCwd)) + "/bd"
-	if got := filepath.Dir(filepath.Dir(run.extracted)); got != tmpRoot {
-		t.Fatalf("archive extracted under %s, want a mktemp dir under %s", got, tmpRoot)
+	extractDir := strings.TrimSpace(string(tarCwd))
+	run.extracted = extractDir + "/bd"
+	// mktemp -d uses TMPDIR on Linux but the per-user temp dir on macOS, so
+	// check only what holds on both: the archive was extracted outside the
+	// install dir, into a dir install_from_release removed before returning.
+	if extractDir == installDir || strings.HasPrefix(extractDir, installDir+"/") {
+		t.Fatalf("archive extracted under %s, want a mktemp dir outside the install dir", extractDir)
+	}
+	if _, err := os.Lstat(extractDir); err == nil {
+		t.Fatalf("install_from_release left its mktemp dir %s behind\n%s", extractDir, out)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
 	}
 	if data, err := os.ReadFile(callLog); err == nil {
 		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
@@ -271,7 +301,7 @@ func installShTestCopy(t *testing.T) string {
 	return installShLocationBlock.ReplaceAllString(body, `${1}install_dir="$$INSTALL_TEST_DIR"; mkdir -p "$$install_dir"`+"\n")
 }
 
-// callsNaming returns the logged cp/mv calls whose last argument is path.
+// callsNaming returns the logged calls whose last argument is path.
 func (r installShRun) callsNaming(path string) [][]string {
 	var got [][]string
 	for _, call := range r.calls {
@@ -300,8 +330,9 @@ func (r installShRun) requireBD(t *testing.T, want string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("%s mode %v is not executable", target, info.Mode())
+	// 0755 is the archive's mode: every user must be able to run bd.
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("%s mode %#o, want 0755\n%s", target, got, r.output)
 	}
 }
 
@@ -339,18 +370,21 @@ func TestInstallShStagesAndRenamesIntoPlace(t *testing.T) {
 	target := filepath.Join(run.installDir, "bd")
 	staged := run.staged()
 	wantStage := []string{"cp", run.extracted, staged}
+	wantMode := []string{"chmod", "0755", staged}
 	wantRename := []string{"mv", "-f", staged, target}
-	stage, rename := -1, -1
+	stage, mode, rename := -1, -1, -1
 	for i, call := range run.calls {
 		switch strings.Join(call, "\t") {
 		case strings.Join(wantStage, "\t"):
 			stage = i
+		case strings.Join(wantMode, "\t"):
+			mode = i
 		case strings.Join(wantRename, "\t"):
 			rename = i
 		}
 	}
-	if stage < 0 || rename < stage {
-		t.Fatalf("want %q then %q; calls:\n%s%s", wantStage, wantRename, joinCalls(run.calls), run.output)
+	if stage < 0 || mode < stage || rename < mode {
+		t.Fatalf("want %q, then %q, then %q; calls:\n%s%s", wantStage, wantMode, wantRename, joinCalls(run.calls), run.output)
 	}
 	if onto := run.callsNaming(target); len(onto) != 1 {
 		t.Fatalf("calls writing %s = %q, want only the rename from %s", target, onto, staged)
@@ -367,12 +401,9 @@ func TestInstallShStagesAndRenamesIntoPlace(t *testing.T) {
 }
 
 // TestInstallShSudoBranchStagesAndRenames covers an install dir the user
-// cannot write: the stage and the rename both run under sudo, with the same
-// same-filesystem rename as the writable branch.
+// cannot write: the stage, the chmod and the rename all run under sudo, with
+// the same same-filesystem rename as the writable branch.
 func TestInstallShSudoBranchStagesAndRenames(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("bash [[ -w ]] is true for root, so the sudo branch is never taken")
-	}
 	run := runInstallShRelease(t, installShOptions{readOnlyDir: true})
 	if run.status != 0 {
 		t.Fatalf("install_from_release returned %d\n%s", run.status, run.output)
@@ -381,18 +412,21 @@ func TestInstallShSudoBranchStagesAndRenames(t *testing.T) {
 	target := filepath.Join(run.installDir, "bd")
 	staged := run.staged()
 	wantStage := strings.Join([]string{"sudo", "cp", run.extracted, staged}, "\t")
+	wantMode := strings.Join([]string{"sudo", "chmod", "0755", staged}, "\t")
 	wantRename := strings.Join([]string{"sudo", "mv", "-f", staged, target}, "\t")
-	stage, rename := -1, -1
+	stage, mode, rename := -1, -1, -1
 	for i, call := range run.calls {
 		switch strings.Join(call, "\t") {
 		case wantStage:
 			stage = i
+		case wantMode:
+			mode = i
 		case wantRename:
 			rename = i
 		}
 	}
-	if stage < 0 || rename < stage {
-		t.Fatalf("want sudo cp to %s then sudo mv -f onto %s; calls:\n%s%s", staged, target, joinCalls(run.calls), run.output)
+	if stage < 0 || mode < stage || rename < mode {
+		t.Fatalf("want sudo cp to %s, sudo chmod 0755 of it, then sudo mv -f onto %s; calls:\n%s%s", staged, target, joinCalls(run.calls), run.output)
 	}
 	for _, call := range run.callsNaming(target) {
 		if call[len(call)-2] != staged {
@@ -404,19 +438,53 @@ func TestInstallShSudoBranchStagesAndRenames(t *testing.T) {
 }
 
 // TestInstallShFailedStageLeavesOldBinaryIntact fails the staged copy (after
-// it wrote a partial file) or the rename: the install must fail, keep the
-// previous bd, and leave no staged temp behind.
+// it wrote a partial file) or the rename, in both branches: the install must
+// fail, keep the previous bd, and leave no staged temp behind. In the sudo
+// branch the dir is read-only again after each sudo command, so only a
+// cleanup run under sudo removes the temp.
 func TestInstallShFailedStageLeavesOldBinaryIntact(t *testing.T) {
-	for _, fail := range []string{"cp", "mv"} {
-		t.Run(fail, func(t *testing.T) {
-			run := runInstallShRelease(t, installShOptions{fail: fail})
+	for _, tc := range []struct {
+		name string
+		opts installShOptions
+	}{
+		{"cp", installShOptions{fail: "cp"}},
+		{"mv", installShOptions{fail: "mv"}},
+		{"sudo_cp", installShOptions{readOnlyDir: true, fail: "cp"}},
+		{"sudo_mv", installShOptions{readOnlyDir: true, fail: "mv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := runInstallShRelease(t, tc.opts)
 			if run.status == 0 {
-				t.Fatalf("install_from_release returned 0 with a failing %s; calls:\n%s%s", fail, joinCalls(run.calls), run.output)
+				t.Fatalf("install_from_release returned 0 with a failing %s; calls:\n%s%s", tc.opts.fail, joinCalls(run.calls), run.output)
 			}
 			if want := "Failed to install bd to " + run.installDir; !strings.Contains(run.output, want) {
 				t.Fatalf("output lacks %q\n%s", want, run.output)
 			}
 			run.requireBD(t, installShOldBD)
+			run.requireNoStagedLeftovers(t)
+		})
+	}
+}
+
+// TestInstallShInstalledBinaryIsWorldExecutable runs both branches under
+// umask 077. The old mv kept the mode tar gave the binary (the archive's 0755
+// when root runs it), but cp creates the staged copy under the caller's
+// umask, so the installer must set 0755 itself or a root or sudo install
+// leaves a bd other users cannot run.
+func TestInstallShInstalledBinaryIsWorldExecutable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts installShOptions
+	}{
+		{"writable", installShOptions{umask: "077"}},
+		{"sudo", installShOptions{readOnlyDir: true, umask: "077"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := runInstallShRelease(t, tc.opts)
+			if run.status != 0 {
+				t.Fatalf("install_from_release returned %d\n%s", run.status, run.output)
+			}
+			run.requireBD(t, installShNewBD)
 			run.requireNoStagedLeftovers(t)
 		})
 	}
